@@ -13,16 +13,26 @@ if __name__ == '__main__':
     commu = pykrcc.pykrcc(ip='127.0.0.1', port=9105, timeout=4)
     
     commu.startLog('commu.log')
-    commu.save('data1.as')
-    #commu.load('data1.as', '/Q')
-    #commu.save('data2.as')
-    #commu.cmdInquiry = cmd_inq
-    # while True:
-    #     d = input('>')
-    #     if d == 'exit':
-    #         break
-    #     response = commu.command(d)
-    #     print(response[1])
+    while True:
+        cmd = input('> ')
+        if cmd == 'quit':
+            break
+        if 'save' in cmd:
+            parts = cmd.split(' ')
+            filename = parts[1]
+            qual = ''
+            if '/' in parts[0]:
+                qual = parts[0][4:]
+            commu.save(filename, qual=qual)            
+        if 'load' in cmd:
+            parts = cmd.split(' ')
+            filename = parts[1]
+            qual = ''
+            if '/' in parts[0]:
+                qual = parts[0][4:]
+            commu.load(filename, qual=qual)  
+        response = commu.command(input('> '))
+        
     commu.disconnect()
     commu.stopLog()
     del commu

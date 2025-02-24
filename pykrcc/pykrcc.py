@@ -2,7 +2,7 @@ from gc import enable
 import logging
 logger = logging.getLogger()
 logging.basicConfig()
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 import telnetlib as tlib
 import time
