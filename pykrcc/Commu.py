@@ -1,3 +1,4 @@
+from gc import enable
 import logging
 logger = logging.getLogger()
 logging.basicConfig()
@@ -28,14 +29,30 @@ class Commu:
         self.IsConnected = False
         self.__logging = False
         self.__logging_file = None
-        self.__cmd_terminators = [b'\x0a>', b'Press SPACE key to continue.', b'Yes:1, No:0']
-        self.__load_terminators = [b'\x17', b'1:Yes, 0:No / 2:Load all, 3:Exit']
-        self.__as_terminators = [b'errors', 
-                                b'1:Yes, 0:No / 2:Load all, 3:Exit', 
-                                b'E\x17', 
-                                b'Delete program and abort', 
-                                b'Are you sure ? \(Yes:1, No:0\)',
-                                b'.\x1b\[2D\x1b\[K>']
+        self.__cmd_terminators = [b'\x0a>', 
+                                  b'Press SPACE key to continue.', 
+                                  b'Yes:1, No:0']
+        
+        self.__as_terminators = [b'.as',
+                                 b'LOAD in progress',
+                                 b'1:Yes, 0:No / 2:Load all, 3:Exit',
+                                 b'Delete program and abort',
+                                 b'Are you sure ? \(Yes:1, No:0\)',
+                                 b'E\x17',
+                                 b'errors',
+                                 b'\x02C\x17',
+                                 b'Force load'
+                                 b'Press ENTER.'
+                                 ]
+        
+        
+        # self.__load_terminators = [b'\x17', b'1:Yes, 0:No / 2:Load all, 3:Exit']
+        # self.__as_terminators = [b'errors', 
+        #                         b'1:Yes, 0:No / 2:Load all, 3:Exit', 
+        #                         b'E\x17', 
+        #                         b'Delete program and abort', 
+        #                         b'Are you sure ? \(Yes:1, No:0\)',
+        #                         b'.\x1b\[2D\x1b\[K>']
         self.cmdInquiry = self.default_cmd_inquiry
         self.asInquiry = self.default_as_inquiry
 
@@ -96,15 +113,17 @@ class Commu:
         if b'errors' in as_msg:
             return b'break'
         if b'1:Yes, 0:No / 2:Load all, 3:Exit' in as_msg:
-            return b'1\r\n'
+            return b'2\r\n'
         if b'E\x17' in as_msg:
             return None
         if b'Delete program and abort' in as_msg:
             return b'0\r\n'
         if b'Are you sure' in as_msg:
             return b'1\r\n'
-        if b'.\x1b[2D\x1b[K>' in as_msg:
-            return None
+        if b'Force load' in as_msg:
+            return b'9\r\n'
+        if b'Press ENTER.' in as_msg:
+            return b'\r\n'
         return None
 
     def __read_until_many(self, matches: list, timeout: int = None) -> bytearray:
@@ -160,11 +179,6 @@ class Commu:
         return raw_data
 
     def __process_data(self, data: bytearray) -> list:
-        # Append regular expression
-        # data = re.sub(rb'\r\nProgram [^\n\r]+\r\n', b'', data)
-        # data = re.sub(rb'\r\nReal\r\n', b'\r\n', data)
-        # data = re.sub(rb'\r\nTransformation\r\n', b'\r\n', data)
-        # data = re.sub(rb'\r\nString\r\n', b'\r\n', data)
         data = re.sub(rb'\x17{0,1}\x05\x02[DE]{0,1}', b'', data)
         clean_data = []
         for line in data.splitlines():
@@ -270,82 +284,185 @@ class Commu:
             logger.error(f'Unexpected error: {e}')
             return (-2, 'Unexpected error')
 
-    def __parse_file_to_blocks(self, content) -> list:
-        content_lines = content.splitlines()
+    # def __parse_file_to_blocks(self, content) -> list:
+    #     content_lines = content.splitlines()
+    #     content_blocks = []
+    #     block = ''
+    #     for line in content_lines:
+    #         block = block + line + '\r\n'
+    #         if line.strip().upper() == '.END':
+    #             content_blocks.append(block)
+    #             block = ''
+    #     return content_blocks
+       
+    # def __load_block(self, block: str, qual: str) -> int:
+    #     _qual = b''
+    #     if qual is not None:
+    #         if qual != '/Q':
+    #             logger.error('Invalid qualifier')
+    #             return -4
+    #         _qual = b'/Q'
+    #     if not self.IsConnected:
+    #         return -3
+    #     max_chars = 492
+    #     content_blocks = [block[i:i+max_chars] for i in range(0, len(block), max_chars)]
+    #     self.__write(b'load'+ _qual + b' file'  + b'\r\n')
+    #     response = self.__read_until(b'.as')
+    #     if b'LOAD in progress' in response:
+    #         logger.error('SAVE/LOAD in progress')
+    #         if self.__logging_file:
+    #             self.__logging_file.write(response.decode())
+    #         return -2
+    #     self.__write(b'\x02A    0\x17')
+    #     d = self.__read_until(b'\x17')
+    #     for i in range(0, len(content_blocks), 1):
+    #         self.__write(b'\x02C    0' + content_blocks[i].encode() + b'\r\n\x17')
+    #         response = self.__read_until_many(self.__load_terminators, 1)
+    #         request = self.asInquiry(response)
+    #         if request is not None:
+    #             self.__write(request)
+    #     empty_breaks = 0
+    #     while True:
+    #         response = self.__read_until_many(self.__load_terminators, 1)
+    #         request = self.asInquiry(response)
+    #         if response == b'':
+    #             empty_breaks += 1
+    #             if empty_breaks > 2:
+    #                 break
+    #         if request is not None:
+    #             if request == b'break':
+    #                 break
+    #             self.__write(request)
+
+    #     self.__write(b'\x02' + b'C    0' + b'\x1a\x17')
+    #     self.__write(b'\r\n')
+    #     response = self.__read_until(b'E\x17')
+    #     self.__write(b'\x02' + b'E    0' + b'\x17')
+    #     response = self.__read_until(b'>')
+    #     return 0
+
+    # def load(self, fname: str, qual: str = None) -> int:
+
+
+    #     # Do not write raw data to logging file
+    #     enable_later = False
+    #     if self.__logging:
+    #         enable_later = True
+    #         self.__logging = False
+
+    #     try:
+    #         max_chars = 492
+    #         content = open(fname, 'r').read()
+    #         content_blocks = self.__parse_file_to_blocks(content)
+    #         for block in content_blocks:
+    #             self.__load_block(block, qual)
+    #         return 0
+    #     except FileNotFoundError:
+    #         logger.error(f'File not found: {fname}')
+    #         return -3
+    #     except TimeoutError:
+    #         logger.warning('Timeout while reading')
+    #         return -1
+    #     except Exception as e:
+    #         logger.error(f'Unexpected error: {e}')
+    #         return -4
+    #     finally:
+    #         self.__logging = enable_later
+  
+    def __split_content_to_blocks(self, content: list) -> list:
+        
+        max_chars = 492
+        
         content_blocks = []
         block = ''
-        for line in content_lines:
-            block = block + line + '\r\n'
-            if line.strip().upper() == '.END':
+
+        for line in content:
+            if len(block) + len(line) + 2 >= max_chars:
                 content_blocks.append(block)
                 block = ''
+            block = block + line 
+        if block != '':
+            content_blocks.append(block)
         return content_blocks
-       
-    def __load_block(self, block: str, qual: str) -> int:
-        _qual = b''
-        if qual is not None:
-            if qual != '/Q':
-                logger.error('Invalid qualifier')
-                return -4
-            _qual = b'/Q'
-        if not self.IsConnected:
-            return -3
-        max_chars = 492
-        content_blocks = [block[i:i+max_chars] for i in range(0, len(block), max_chars)]
-        self.__write(b'load'+ _qual + b' file'  + b'\r\n')
-        response = self.__read_until(b'.as')
-        if b'LOAD in progress' in response:
-            logger.error('SAVE/LOAD in progress')
-            if self.__logging_file:
-                self.__logging_file.write(response.decode())
-            return -2
-        self.__write(b'\x02A    0\x17')
-        d = self.__read_until(b'\x17')
-        for i in range(0, len(content_blocks), 1):
-            self.__write(b'\x02C    0' + content_blocks[i].encode() + b'\r\n\x17')
-            response = self.__read_until_many(self.__load_terminators, 1)
-            request = self.asInquiry(response)
-            if request is not None:
-                self.__write(request)
-        empty_breaks = 0
-        while True:
-            response = self.__read_until_many(self.__load_terminators, 1)
-            request = self.asInquiry(response)
-            if response == b'':
-                empty_breaks += 1
-                if empty_breaks > 2:
-                    break
-            if request is not None:
-                if request == b'break':
-                    break
-                self.__write(request)
-
-        self.__write(b'\x02' + b'C    0' + b'\x1a\x17')
-        self.__write(b'\r\n')
-        response = self.__read_until(b'E\x17')
-        self.__write(b'\x02' + b'E    0' + b'\x17')
-        response = self.__read_until(b'>')
-        return 0
 
     def load(self, fname: str, qual: str = None) -> int:
-
-
-        # Do not write raw data to logging file
+        # Check connection
+        if not self.IsConnected:
+            logger.error('Not connected')
+            return -3
+        # Disable logging while loading
         enable_later = False
         if self.__logging:
             enable_later = True
             self.__logging = False
-
+        # Get qualifier
+        _qual = b''
+        if qual is not None:
+            _qual = qual.encode()
+        # Load file
         try:
-            max_chars = 492
-            content = open(fname, 'r').read()
-            content_blocks = self.__parse_file_to_blocks(content)
-            for block in content_blocks:
-                self.__load_block(block, qual)
-            return 0
+            max_chars = 470
+            with open(fname, 'r') as f:
+                content = f.readlines()
+            content_blocks = self.__split_content_to_blocks(content)
         except FileNotFoundError:
             logger.error(f'File not found: {fname}')
             return -3
+        except Exception as e:
+            logger.error(f'Unexpected error: {e}')
+            return -4
+        finally:
+            self.__logging = enable_later
+        # Load data to controller
+        try:
+            self.__write(b'load'+ _qual + b' file'  + b'\r\n')
+            # Add to logging file
+            if self.__logging_file is not None:
+                self.__logging_file.write(f'load{_qual} file')
+            response = self.__read_until_many(self.__as_terminators, 2)
+            # Check if load is in progress
+            if b'LOAD in progress' in response:
+                logger.error('SAVE/LOAD in progress')
+                if self.__logging_file:
+                    self.__logging_file.write('SAVE/LOAD in progress')
+                return -2
+            self.__write(b'\x02A    0\x17')
+            response = self.__read_until(b'\x17')
+            logger.debug(response)
+            
+            empty_counter = 0
+            for block in content_blocks:
+                self.__write(b'\x02C    0' + block.encode() + b'\r\n\x17')
+                response = self.__read_until_many(self.__as_terminators, 1)
+                logger.debug(response)
+                request = self.asInquiry(response)
+                if request is not None:
+                    self.__write(request)
+                if response == b'':
+                    empty_counter += 1
+                    if empty_counter > 2:
+                        break
+            empty_counter = 0
+            while True:
+                response = self.__read_until_many(self.__as_terminators, 1)
+                logger.debug(response)
+                request = self.asInquiry(response)
+                if request is not None:
+                    self.__write(request)
+                if response == b'':
+                    empty_counter += 1
+                    if empty_counter > 2:
+                        break
+            self.__write(b'\x02' + b'C    0' + b'\x1a\x17')
+            self.__write(b'\r\n')
+            response = self.__read_until(b'E\x17')
+            self.__write(b'\x02' + b'E    0' + b'\x17')
+            response = self.__read_until(b'>')
+            return 0
+            # for block in content_blocks:
+            #     self.__write(f'load{_qual} file.as{_prog}\r\n'.encode())
+            #     self.__read_until(b'.as')
+            #     self.__write(block.encode() + b'\x17')
         except TimeoutError:
             logger.warning('Timeout while reading')
             return -1
@@ -354,12 +471,8 @@ class Commu:
             return -4
         finally:
             self.__logging = enable_later
-  
-    def save(self, fname: str, prog: str = None, qual: str = None) -> int:
-        if not self.IsConnected:
-            return -3
 
-        # Do not write raw data to logging file
+    def save(self, fname: str, prog: str = None, qual: str = None) -> int:
         enable_later = False
         if self.__logging:
             enable_later = True
