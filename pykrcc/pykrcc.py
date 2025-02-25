@@ -422,6 +422,8 @@ class pykrcc:
         """
         if not self.IsConnected:
             return (-2, 'Not connected')
+        if cmd is None:
+            cmd = ''
         response_ret = b''
         try:
             self.__write(cmd.encode() + b'\r\n')
