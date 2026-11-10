@@ -5,6 +5,7 @@ import re
 import shlex
 import threading
 import tkinter as tk
+import unicodedata
 from tkinter import filedialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
@@ -12,6 +13,45 @@ from pykrcc import pykrcc as krcc
 
 
 _SAVE_LOAD_RE = re.compile(r"^\s*(?:save|load)(?:\s|/|$)", re.IGNORECASE)
+_NUMBERED_CHOICES = re.compile(
+    r"(?<!\d)(\d+)\s*:\s*(.*?)(?=(?:[,/)、，；]|\s+\d+\s*:|[)]|$))"
+)
+_LABELLED_CHOICES = re.compile(r"([^,:/()]+?)\s*:\s*(\d+)(?=\s*[,/)、，；]|$)")
+
+
+def display_controller_text(msg):
+    try:
+        display_text = msg.encode("latin-1").decode("cp932")
+        if any("\ue000" <= char <= "\uf8ff" for char in display_text):
+            return msg
+        return display_text
+    except UnicodeError:
+        return msg
+
+
+def builtin_inquiry_options(msg):
+    for pattern, default in krcc.DEFAULT_RESPONSES:
+        if pattern not in msg:
+            continue
+        choice_text = unicodedata.normalize(
+            "NFKC", display_controller_text(pattern)
+        )
+        choices = {}
+        for value, label in _NUMBERED_CHOICES.findall(choice_text):
+            choices[value + "\n"] = "%s — %s" % (value, label.strip())
+        for label, value in _LABELLED_CHOICES.findall(choice_text):
+            choices[value + "\n"] = "%s — %s" % (value, label.strip())
+        if default == "\n":
+            choices.setdefault(default, "Enter")
+        elif default not in choices:
+            choices[default] = default.strip()
+        if default == "0\n" and len(choices) == 1:
+            choices["9\n"] = "9"
+            choices["2\n"] = "2"
+        return [(default, choices[default])] + [
+            (value, label) for value, label in choices.items() if value != default
+        ]
+    return None
 
 
 class TerminalGui:
@@ -26,6 +66,7 @@ class TerminalGui:
         self.connected = False
         self.connecting = False
         self.closing = False
+        self.pending_inquiry = None
 
         self.connection_type = tk.StringVar(value="TCP")
         self.host = tk.StringVar(value="192.168.0.2")
@@ -406,6 +447,10 @@ class TerminalGui:
                 com.progress = lambda done, total: self.events.put(
                     ("progress", done, total)
                 )
+                com.asInquiry = self._request_inquiry
+                com.load_save_output = lambda msg: self.events.put(
+                    ("load_save_output", msg)
+                )
                 self.events.put(("status", True, "Подключено к %s" % com.name()))
             elif operation == "disconnect":
                 if com is not None:
@@ -436,10 +481,6 @@ class TerminalGui:
                     _, filename, qualifier = action
                     result = com.load(filename, qualifier)
                 self.events.put(("output", "%s -> %s\n" % (operation, result)))
-                if com.LoadSaveMsg:
-                    self.events.put(("output", com.LoadSaveMsg))
-                    if not com.LoadSaveMsg.endswith(("\n", "\r")):
-                        self.events.put(("output", "\n"))
             elif operation == "start_log":
                 if com is None or not com.IsConnected:
                     self.events.put(("error", "[соединение не установлено]\n"))
@@ -462,6 +503,15 @@ class TerminalGui:
                 self._append(event[1])
             elif event[0] == "error":
                 self._append(event[1])
+            elif event[0] == "load_save_output":
+                text = display_controller_text(event[1])
+                self._append(text + ("" if text.endswith(("\n", "\r")) else "\n"))
+            elif event[0] == "inquiry":
+                _, msg, choices, response = event
+                if self.closing:
+                    response.put(choices[0][0])
+                else:
+                    self._show_inquiry_dialog(msg, choices, response)
             elif event[0] == "status":
                 self.connected = event[1]
                 self.connecting = False
@@ -488,10 +538,58 @@ class TerminalGui:
         else:
             self.root.after(50, self._process_events)
 
+    def _request_inquiry(self, msg):
+        choices = builtin_inquiry_options(msg)
+        if choices is None:
+            return None
+        response = queue.Queue(maxsize=1)
+        self.events.put(("inquiry", msg, choices, response))
+        return response.get()
+
+    def _show_inquiry_dialog(self, msg, choices, response):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Вопрос контроллера")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        self.pending_inquiry = (dialog, response, choices[0][0])
+
+        text = display_controller_text(msg)
+        ttk.Label(
+            dialog, text=text, wraplength=480, justify=tk.LEFT, padding=16
+        ).pack(fill=tk.X)
+        buttons = ttk.Frame(dialog, padding=(8, 0, 8, 8))
+        buttons.pack(fill=tk.X)
+
+        def choose(value):
+            if response.empty():
+                response.put(value)
+            self.pending_inquiry = None
+            dialog.destroy()
+
+        for value, label in choices:
+            ttk.Button(
+                buttons, text=label, command=lambda answer=value: choose(answer)
+            ).pack(side=tk.LEFT, padx=4)
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose(choices[0][0]))
+        dialog.bind("<Escape>", lambda _event: choose(choices[0][0]))
+        dialog.grab_set()
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry("+%d+%d" % (x, y))
+        dialog.focus_set()
+
     def close(self):
         if self.closing:
             return
         self.closing = True
+        if self.pending_inquiry is not None:
+            dialog, response, default = self.pending_inquiry
+            self.pending_inquiry = None
+            if response.empty():
+                response.put(default)
+            dialog.destroy()
         self.status.set("Завершение…")
         self.actions.put(("shutdown",))
 

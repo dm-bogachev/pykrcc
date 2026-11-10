@@ -76,6 +76,26 @@ def is_manual_save_load(line):
     return bool(re.match(r"^\s*(?:save|load)(?:\s|/|$)", line, re.IGNORECASE))
 
 
+def inquire_builtin(msg):
+    """Запросить выбор для встроенного вопроса SAVE/LOAD."""
+    for pattern, default in krcc.DEFAULT_RESPONSES:
+        if pattern in msg:
+            default_label = default.strip() or "Enter"
+            answer = input(paint("Выбор [%s]: " % default_label, "cyan")).strip()
+            return (answer or default).rstrip("\r\n") + "\n"
+    return None
+
+
+def display_controller_text(msg):
+    try:
+        display_text = msg.encode("latin-1").decode("cp932")
+        if any("\ue000" <= char <= "\uf8ff" for char in display_text):
+            return msg
+        return display_text
+    except UnicodeError:
+        return msg
+
+
 def watcher(com, stop):
     """Фоновый вывод самопроизвольных сообщений контроллера."""
     while not stop.is_set():
@@ -99,10 +119,8 @@ def local(com, line, state):
         quals = [x for x in a[1:] if x.startswith("/")]
         progs = [x for x in a[1:] if not x.startswith("/")]
         print("save ->", com.save(a[0], progs[0] if progs else "", "".join(quals)))
-        print(com.LoadSaveMsg, end="")
     elif c == "load" and a:
         print("load ->", com.load(a[0], a[1] if len(a) > 1 else ""))
-        print(com.LoadSaveMsg, end="")
     elif c == "log" and a:
         if a[0] == "off":
             com.stopLog()
@@ -140,10 +158,30 @@ def main():
         return
     except krcc.CommuError as e:
         sys.exit(paint("Ошибка подключения: %s" % e, "red"))
+    com.asInquiry = inquire_builtin
+    transfer = {"progress_active": False}
+
+    def report_load_save_output(msg):
+        if transfer["progress_active"]:
+            print(flush=True)
+            transfer["progress_active"] = False
+        text = display_controller_text(msg)
+        sys.stdout.write(text)
+        if not text.endswith(("\n", "\r")):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    com.load_save_output = report_load_save_output
     if not args.no_progress:
-        com.progress = lambda v, t: print(
-            "\r%s / %s" % (v, t), end="" if v >= 0 else "\n", flush=True
-        )
+        def report_progress(done, total):
+            print(
+                "\r%s / %s" % (done, total),
+                end="" if done >= 0 else "\n",
+                flush=True,
+            )
+            transfer["progress_active"] = done >= 0
+
+        com.progress = report_progress
 
     state = {"tmo": args.timeout}
     stop = threading.Event()

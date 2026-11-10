@@ -12,8 +12,9 @@ pykrcc -- чистая Python-реализация класса ``KRcc.Commu`` (
 * :class:`Commu` -- соединение с контроллером: ``command``, ``load``, ``save``,
   ``connect``/``disconnect``, ``startLog``/``stopLog``, ``name``, свойства
   ``IsConnected``, ``TimeoutValue``, ``LoadSaveMsg`` и делегаты ``asInquiry``,
-  ``cmdInquiry``, ``progress``.
-* Делегаты :data:`ASInquiry`, :data:`CmdInquiry`, :data:`Progress`
+  ``cmdInquiry``, ``progress``, ``load_save_output``.
+* Делегаты :data:`ASInquiry`, :data:`CmdInquiry`, :data:`Progress` и
+  :data:`LoadSaveOutput`
   (в Python это обычные вызываемые объекты).
 * Исключения :class:`CommuError`, :class:`ConnectError`, :class:`LoginError`,
   :class:`NoResponseError` с теми же текстами, что и у .NET-библиотеки
@@ -60,6 +61,10 @@ pykrcc -- чистая Python-реализация класса ``KRcc.Commu`` (
     Ход ``load``/``save``: ``done`` -- число переданных байт (``-1`` по окончании),
     ``total`` -- размер загружаемого файла (при ``save`` всегда ``-1``).
 
+``LoadSaveOutput(msg: str) -> None``
+    Вызывается для каждой текстовой строки контроллера во время ``load``/``save``,
+    в том числе для вопросов до вызова :data:`ASInquiry`.
+
 Протокол (восстановлен по krcc64.dll)
 =====================================
 
@@ -91,6 +96,7 @@ from typing import Callable, List, Optional, Tuple
 __all__ = [
     "Commu", "Ccommu", "ASInquiry", "CmdInquiry", "Progress",
     "CommuError", "ConnectError", "LoginError", "NoResponseError",
+    "LoadSaveOutput",
     "DEFAULT_RESPONSES", "DEBUG",
 ]
 __version__ = "2.0"
@@ -108,6 +114,8 @@ ASInquiry = Callable[[str], Optional[str]]
 CmdInquiry = Callable[[str], Optional[str]]
 #: ``delegate void Progress(int, int)`` -- ход load/save.
 Progress = Callable[[int, int], None]
+#: Полученная текстовая строка во время SAVE/LOAD.
+LoadSaveOutput = Callable[[str], None]
 
 
 # --------------------------------------------------------------------------- #
@@ -520,8 +528,9 @@ class Commu:
     :class:`LoginError` (``"can't login"``), :class:`NoResponseError`.
 
     Атрибуты-делегаты (по умолчанию ``None``): :attr:`as_inquiry`,
-    :attr:`cmd_inquiry`, :attr:`progress`.  Один экземпляр безопасно использовать
-    из нескольких потоков: команды выполняются строго по очереди.
+    :attr:`cmd_inquiry`, :attr:`progress`, :attr:`load_save_output`. Один
+    экземпляр безопасно использовать из нескольких потоков: команды выполняются
+    строго по очереди.
     """
 
     #: Пауза после приветствия telnet перед отправкой логина (в оригинале 1 с).
@@ -537,6 +546,7 @@ class Commu:
         self.asInquiry: Optional[ASInquiry] = None
         self.progress: Optional[Progress] = None
         self.cmdInquiry: Optional[CmdInquiry] = None
+        self.load_save_output: Optional[LoadSaveOutput] = None
         self._timeout_value = 5000
         self._load_save_msg = ""
         self._name = port
@@ -1092,6 +1102,9 @@ class Commu:
                 continue
             text = self._dec(line).replace(converted, "(" + self._fname + ")")
             msg, _ = self._strip_ctrl(text.rstrip("\r\n"))
+            output_cb = self.load_save_output
+            if output_cb is not None:
+                output_cb(msg)
             answer = self._interactive(msg)
             if answer is not None:
                 count += 1

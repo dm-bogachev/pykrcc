@@ -50,6 +50,7 @@ TCP [[login@]host] [port] [timeout_ms] [nodelay]
 | `as_inquiry` | `asInquiry` | Callback для вопросов во время `save`/`load` |
 | `cmd_inquiry` | `cmdInquiry` | Callback для строк ответа на обычные команды |
 | `progress` | — | Callback прогресса передачи `save`/`load` |
+| `load_save_output` | — | Callback для каждой текстовой строки контроллера во время `save`/`load` |
 
 Callbacks изначально равны `None`. Значения свойств `TimeoutValue` и
 `timeout_value` взаимозаменяемы.
@@ -135,6 +136,12 @@ Callbacks изначально равны `None`. Значения свойст�
 Вызывается при вопросах контроллера во время `save`/`load`. Верните строку,
 которую нужно отправить контроллеру (например, `"0\n"`). Возврат `None`
 позволяет библиотеке подобрать ответ из `DEFAULT_RESPONSES`.
+
+### `LoadSaveOutput(msg: str) -> None`
+
+Вызывается для каждой текстовой строки контроллера во время `save`/`load`,
+включая строки-вопросы до вызова `ASInquiry`. Установите `com.load_save_output`,
+чтобы отображать ход операции по мере получения сообщений.
 
 ### `CmdInquiry(msg: str) -> Optional[str]`
 
