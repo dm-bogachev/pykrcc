@@ -1,636 +1,1162 @@
-from gc import enable
-import logging
-logger = logging.getLogger()
-logging.basicConfig()
-logger.setLevel(logging.DEBUG)
+"""
+pykrcc -- чистая Python-реализация класса ``KRcc.Commu`` (Kawasaki Robot Control Class Library).
 
-import telnetlib as tlib
-import time
-import socket
-import re
+Модуль общается с контроллером робота Kawasaki (язык AS) по TCP/IP (telnet-порт 23,
+либо PC-AS/ROSET) и, в экспериментальном режиме, по последовательному порту. Нужна
+только стандартная библиотека Python 3.8+, работает на Windows, Linux и macOS;
+``krcc64.dll``, .NET и pythonnet **не требуются**.
+
+Что реализовано
+===============
+
+* :class:`Commu` -- соединение с контроллером: ``command``, ``load``, ``save``,
+  ``connect``/``disconnect``, ``startLog``/``stopLog``, ``name``, свойства
+  ``IsConnected``, ``TimeoutValue``, ``LoadSaveMsg`` и делегаты ``asInquiry``,
+  ``cmdInquiry``, ``progress``.
+* Делегаты :data:`ASInquiry`, :data:`CmdInquiry`, :data:`Progress`
+  (в Python это обычные вызываемые объекты).
+* Исключения :class:`CommuError`, :class:`ConnectError`, :class:`LoginError`,
+  :class:`NoResponseError` с теми же текстами, что и у .NET-библиотеки
+  (``"can't connect TCP/IP"``, ``"can't login"``).
+
+Имена как в оригинале и в стиле Python
+======================================
+
+Каждый член оригинального API доступен под двумя именами::
+
+    com.IsConnected   == com.is_connected
+    com.TimeoutValue  =  com.timeout_value = 3000
+    com.LoadSaveMsg   == com.load_save_msg
+    com.asInquiry     == com.as_inquiry
+    com.cmdInquiry    == com.cmd_inquiry
+    com.startLog(..)  == com.start_log(..)
+    com.stopLog()     == com.stop_log()
+    com.Dispose()     == com.dispose()
+
+Класс также доступен под именем :class:`Ccommu` (синоним :class:`Commu`) и
+поддерживает ``with``::
+
+    import pykrcc
+
+    with pykrcc.Commu("TCP 192.168.0.2") as com:
+        code, text = com.command("where", 3000)
+
+Делегаты в Python
+=================
+
+``ASInquiry(msg: str) -> Optional[str]``
+    Вызывается при ``load``/``save``, когда контроллер прислал вопрос. Верните
+    строку-ответ (например ``"0\\n"``) или ``None`` -- тогда будет использован ответ
+    по умолчанию из встроенной таблицы (см. :data:`DEFAULT_RESPONSES`).
+
+``CmdInquiry(msg: str) -> Optional[str]``
+    Вызывается из ``command`` для каждой строки ответа контроллера (когда делегат
+    задан, строки *не* накапливаются в результате). Верните строку, чтобы отправить
+    её контроллеру (например ``" "`` на ``"Press SPACE key continue."``), иначе
+    ``None``.  Сигнатуру из примера документации ``(msg, ref resp) -> bool``
+    в Python выразить нельзя, поэтому ответ возвращается как значение.
+
+``Progress(done: int, total: int) -> None``
+    Ход ``load``/``save``: ``done`` -- число переданных байт (``-1`` по окончании),
+    ``total`` -- размер загружаемого файла (при ``save`` всегда ``-1``).
+
+Протокол (восстановлен по krcc64.dll)
+=====================================
+
+* Логин: после TCP-соединения отправляются 5 байт ``FF FA 18 F0 0A``, пауза 1 с,
+  имя ``khidl`` (или ``as``) + ``CR LF``; контроллер отвечает приглашением ``>``
+  в начале строки.
+* Команда: ``<текст>\n``; контроллер возвращает эхо, строки ответа и снова ``>``.
+* ``SAVE``/``LOAD`` отправляют служебное имя ``using.rcc``; реальные данные
+  переносятся кадрами ``ENQ STX <A..F> ... ETB`` (open/read/write/close).
+
+.. note::
+   Протокол восстановлен дизассемблированием DLL и проверен на собственной
+   имитации контроллера (``mock_controller.py``), но **не** на реальном роботе.
+   Если на вашем контроллере что-то ведёт себя иначе -- включите отладочный журнал
+   (``pykrcc.DEBUG = True``) и сравните байты.
+"""
+
+from __future__ import annotations
+
 import os
+import select
+import socket
+import sys
+import threading
+import time
+from collections import deque
+from typing import Callable, List, Optional, Tuple
 
-#TODO: Add code comments
+__all__ = [
+    "Commu", "Ccommu", "ASInquiry", "CmdInquiry", "Progress",
+    "CommuError", "ConnectError", "LoginError", "NoResponseError",
+    "DEFAULT_RESPONSES", "DEBUG",
+]
+__version__ = "2.0"
 
-class pykrcc:
+#: Печатать в stderr отладочную информацию о принятых/отправленных байтах.
+DEBUG = False
+
+# --------------------------------------------------------------------------- #
+# Делегаты (в Python -- обычные callable)
+# --------------------------------------------------------------------------- #
+
+#: ``delegate string ASInquiry(string)`` -- вопрос контроллера при load/save.
+ASInquiry = Callable[[str], Optional[str]]
+#: ``delegate string CmdInquiry(string)`` -- строка ответа контроллера в command().
+CmdInquiry = Callable[[str], Optional[str]]
+#: ``delegate void Progress(int, int)`` -- ход load/save.
+Progress = Callable[[int, int], None]
+
+
+# --------------------------------------------------------------------------- #
+# Исключения
+# --------------------------------------------------------------------------- #
+
+class CommuError(Exception):
+    """Базовое исключение библиотеки; ``str(e)`` совпадает с ``e.Message`` из .NET."""
+
+    @property
+    def Message(self) -> str:  # совместимость с примерами на C#/VB
+        return str(self)
+
+
+class ConnectError(CommuError):
+    """Не удалось установить соединение: ``"can't connect TCP/IP"``."""
+
+
+class LoginError(CommuError):
+    """Соединение есть, но контроллер не принял логин: ``"can't login"``."""
+
+
+class NoResponseError(CommuError):
+    """Контроллер не ответил на проверочную команду: ``"no response TCP port"``."""
+
+
+# --------------------------------------------------------------------------- #
+# Константы протокола
+# --------------------------------------------------------------------------- #
+
+_ENQ, _STX, _ETB, _SUB, _DLE, _BEL, _SYN = 5, 2, 23, 26, 16, 7, 22
+#: Управляющие символы, которые контроллер вставляет в текст сообщений.
+_CTRL = (0x10, 0x07, 0x12, 0x14, 0x16, 0x19)
+_FLUSH = 0xF000            # маркер «конец порции» в кольцевом буфере
+_DUMMY_NAME = "using.rcc"  # служебное имя файла в командах SAVE/LOAD
+_CHUNK = 2910              # размер порции данных при LOAD (кадр 'C')
+_TELNET_GREETING = b"\xff\xfa\x18\xf0\n"
+_E_OPEN = -3               # внутренняя ошибка: файл не открывается
+
+#: Встроенные ответы на вопросы контроллера: (образец в байтах/latin-1, ответ).
+#: Таблица извлечена из krcc64.dll (секции [builtin-SaveMsg] и [builtin-LoadMsg]);
+#: сообщения на японском хранятся в исходной кодировке (cp932), поэтому образцы
+#: сопоставляются как latin-1-представление сырых байтов.
+_BUILTIN = [
+    (b'\x8am\x94F\x81I\x81i\x83\x8a\x83^\x81[\x83\x93\x93\xfc\x97\xcd\x81j', '\n'),
+    (b'Confirm! (Press ENTER.)', '\n'),
+    (b'Confermare! (Schiacciare ENTER.)', '\n'),
+    (b'Vahvista! (paina ENTER.)', '\n'),
+    (b'Best\xe4tigen! (Dr\xfccken Sie ENTER.)', '\n'),
+    (b'\x82O\x81F\x8fI\x97\xb9\x81A\x82X\x81F\x8d\xc4\x8e\x8e\x8ds', '0\n'),
+    (b'0:abort, 9:retry', '0\n'),
+    (b'0:interromp., 9:riprovare.', '0\n'),
+    (b'\x82P\x81F\x83v\x83\x8d\x83O\x83\x89\x83\x80\x82\xf0\x8d\xed\x8f\x9c\x82\xb5\x8fI\x97\xb9', '1\n'),
+    (b'1:Delete program and abort', '1\n'),
+    (b'1:Elimina pg e interrompe', '1\n'),
+    (b'1:Poista ohjelma ja poistu', '1\n'),
+    (b'1:Programm l\xf6schen und abbrechen', '1\n'),
+    (b'\x8am\x94F! \x8e\xc0\x8ds\x82\xb5\x82\xdc\x82\xb7\x82\xa9\x81H (\x82\xcd\x82\xa2:\x82P, \x82\xa2\x82\xa2\x82\xa6:\x82O)', '0\n'),
+    (b'Are you sure ? (Yes:1, No:0)', '0\n'),
+    (b'Sei sicuro? (S\xec: 1, No:0)', '0\n'),
+    (b'Oletko varma? (Kylla:1, Ei:0)', '0\n'),
+    (b'Sind Sie sicher ? (Ja:1, Nein:0)', '0\n'),
+    (b'\x82P\x81F\x83X\x83L\x83b\x83v, \x82X\x81F\x8b\xad\x90\xa7\x83\x8d\x81[\x83h', '1\n'),
+    (b'1:Skip, 9:Force load', '1\n'),
+    (b'1:Saltare, 9:Caricare forza', '1\n'),
+    (b'\x8d\xed\x8f\x9c\x82\xb5\x82\xdc\x82\xb5\x82\xbd\x81B \x8am\x94F\x81I', '\n'),
+    (b'deleted. Confirm !', '\n'),
+    (b'fallito. Confermare!', '\n'),
+    (b'poistettu. Vahvista!', '\n'),
+    (b'gel\xf6scht. Best\xe4tigen!', '\n'),
+    (b'\x8am\x94F\x81I\x81i\x83\x8a\x83^\x81[\x83\x93\x93\xfc\x97\xcd\x81j', '\n'),
+    (b'Confirm! (Press ENTER.)', '\n'),
+    (b'Confermare! (Schiacciare ENTER.)', '\n'),
+    (b'Vahvista! (paina ENTER.)', '\n'),
+    (b'Best\xe4tigen! (Dr\xfccken Sie ENTER.)', '\n'),
+    (b'\x81i\x82P\x81F\x82\xcd\x82\xa2\x81C\x82O\x81F\x82\xa2\x82\xa2\x82\xa6\x81^\x82Q\x81F\x82\xa0\x82\xc6\x91S\x95\x94\x93\xc7\x82\xdd\x8d\x9e\x82\xdd\x81C\x82R\x81F\x8fI\x97\xb9\x81j', '0\n'),
+    (b'1:Yes, 0:No / 2:Load all, 3:Exit)', '0\n'),
+    (b'1:Si, 0:No / 2:Caricare tutti, 3:Exit)', '0\n'),
+    (b'1:Kylla, 0:Ei / 2:Lataa kaikki, 3:Pois)', '0\n'),
+    (b'1:Ja, 0:Nein / 2:Alles laden, 3:Exit)', '0\n'),
+    (b'\x8f\x88\x97\x9d\x82\xf0\x91I\x82\xf1\x82\xc5\x89\xba\x82\xb3\x82\xa2\x81B', '0\n'),
+    (b'Select procedure.', '0\n'),
+    (b'Seleziona procedura desiderata.', '0\n'),
+    (b'Valitse toiminto.', '0\n'),
+    (b'Gewuenschtes Verfahren auswaehlen', '0\n'),
+]
+DEFAULT_RESPONSES = [(p.decode("latin-1"), r) for p, r in _BUILTIN]
+
+
+def _dbg(*a):
+    if DEBUG:
+        print("[pykrcc]", *a, file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# Кольцевой буфер «слов» (аналог TRingBuff)
+# --------------------------------------------------------------------------- #
+
+class _Ring:
+    """Очередь принятых символов.
+
+    Элемент -- целое: ``0..255`` обычный байт, ``0xFFxx`` -- байт-терминатор строки
+    (LF, ETB, DLE, ``>`` в начале строки), ``0xF000`` -- принудительный конец порции.
+    Каждый терминатор «отпускает» семафор, поэтому ``get`` возвращает по одной
+    строке (вместе с её терминатором).
     """
-    Class for communication with Kawasaki robot controllers.
 
-    This class allows you to connect to a Kawasaki robot controller, send commands and receive responses.
-    It also provides functions for saving and loading programs to/from the controller.
-    """
+    def __init__(self):
+        self._q = deque()
+        self._lock = threading.Lock()
+        self._sem = threading.Semaphore(0)
 
-    def __init__(self, login: str = 'as', ip: str = None, port: int = 23, timeout: int = 20, tcp_nodelay:bool = False) -> None:
+    def push(self, v: int) -> None:
+        with self._lock:
+            self._q.append(v)
+
+    def signal(self) -> None:
+        self._sem.release()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._q.clear()
+        while self._sem.acquire(False):
+            pass
+
+    def empty(self) -> bool:
+        with self._lock:
+            return not self._q
+
+    def get(self, tmo_ms: int, maxlen: int = 4095) -> Tuple[Optional[bytes], bool]:
+        """Вернуть ``(строка|None, timed_out)``.
+
+        ``tmo_ms == 0`` -- не ждать; отрицательное значение -- ждать до 60 с (как в
+        оригинале). По таймауту отдаётся недочитанный остаток строки (так приходят
+        приглашения и вопросы без перевода строки).
         """
-        Initializes a new instance of the pykrcc class.
+        if tmo_ms < 0:
+            tmo_ms = 60000
+        if tmo_ms == 0:
+            self._sem.acquire(False)
+            timed_out = False
+        else:
+            timed_out = not self._sem.acquire(timeout=tmo_ms / 1000.0)
+        with self._lock:
+            if not self._q:
+                return None, timed_out
+            if timed_out and self._q[0] == _ENQ:
+                return None, timed_out
+            out = bytearray()
+            while self._q:
+                v = self._q.popleft()
+                if v == _FLUSH:
+                    break
+                out.append(v & 0xFF)
+                if v & 0xFF00:           # терминатор
+                    break
+                if len(out) >= maxlen:
+                    break
+            return bytes(out), timed_out
 
-        Args:
-            login (str, optional): Login string. Defaults to 'as'.
-            ip (str, optional): IP address of the robot. Defaults to None.
-            port (int, optional): Port number. Defaults to 23.
-            timeout (int, optional): Timeout in milliseconds. Defaults to 20.
-            tcp_nodelay (bool, optional): TCP_NODELAY option. Defaults to False.
-        """
-        
-        # Initialize parameters
-        self.__login = login
-        self.__ip = ip
-        self.__port = port
-        self.TimeoutValue = timeout
-        self.__tcp_nodelay = tcp_nodelay
-        
-        # Initialize internal data
-        self.IsConnected = False
-        self.__logging = False
-        self.__logging_file = None
-        self.__cmd_terminators = [b'\x0a>', 
-                                  b'Press SPACE key to continue.', 
-                                  b'Yes:1, No:0']
-        
-        self.__as_terminators = [b'.as',
-                                 b'LOAD in progress',
-                                 b'1:Yes, 0:No / 2:Load all, 3:Exit',
-                                 b'Delete program and abort',
-                                 b'Are you sure ? \(Yes:1, No:0\)',
-                                 b'E\x17',
-                                 b'errors',
-                                 b'\x02C\x17',
-                                 b'Force load'
-                                 b'Press ENTER.'
-                                 ]
-        
-        self.cmdInquiry = self.default_cmd_inquiry
-        self.asInquiry = self.default_as_inquiry
-        self.progress = self.default_progress
 
-        # Autoconnect
-        _ = self.__connect()
+# --------------------------------------------------------------------------- #
+# Транспорты
+# --------------------------------------------------------------------------- #
 
-    def __del__(self) -> None:
-        """
-        Destructor. Disconnects from the robot and stops logging if needed.
-        """
-        self.disconnect()
-        if self.__logging_file is not None:
-            self.stopLog()
-
-    def __log(self, data) -> None:
-        """
-        Logs the data to the log file and debug output.
-
-        Args:
-            data (bytearray or bytes or str): The data to log.
-        """
+class _TcpTransport:
+    def __init__(self, host: str, port: int, conn_tmo_ms: int, nodelay: bool):
         try:
-            if type(data) is bytes or type(data) is bytearray:
-                data = data.decode()
-            if self.__logging:
-                data = re.sub(r'\x17{0,1}\x05\x02[DE]{0,1}', '', data)
-                self.__logging_file.write(data.replace('\r\n', '\n'))
-                self.__logging_file.flush()
-            logger.debug(data)
-        except Exception as e:
-            logger.error(e)
+            self.sock = socket.create_connection((host, port), timeout=conn_tmo_ms / 1000.0)
+        except (OSError, socket.timeout):
+            raise ConnectError("can't connect TCP/IP")
+        self.sock.settimeout(None)
+        if nodelay:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    def __process_options(self, socket, cmd, opt) -> None:
+    def send(self, data: bytes) -> None:
+        self.sock.sendall(data)
+
+    def recv(self) -> bytes:
+        try:
+            return self.sock.recv(4096)
+        except OSError:
+            return b""
+
+    def close(self) -> None:
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class _SerialTransport:
+    """Последовательный порт без pyserial (termios на POSIX, kernel32 на Windows).
+
+    ЭКСПЕРИМЕНТАЛЬНО: проверено только по документации ОС, не на оборудовании.
+    """
+
+    _BAUDS = (110, 300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200)
+
+    def __init__(self, device: str, baud: int):
+        self._closed = False
+        if os.name == "nt":
+            self._open_win(device, baud)
+        else:
+            self._open_posix(device, baud)
+
+    # -- POSIX ------------------------------------------------------------ #
+    def _open_posix(self, device, baud):
+        import termios
+        self._win = False
+        name = "B%d" % baud
+        if not hasattr(termios, name):
+            raise ConnectError("can't connect COM port")
+        try:
+            self.fd = os.open(device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+            attrs = termios.tcgetattr(self.fd)
+            iflag, oflag, cflag, lflag, ispeed, ospeed, cc = attrs
+            iflag = 0
+            oflag = 0
+            lflag = 0
+            cflag = (cflag & ~(termios.CSIZE | termios.PARENB | termios.CSTOPB)) | \
+                termios.CS8 | termios.CLOCAL | termios.CREAD
+            speed = getattr(termios, name)
+            cc[termios.VMIN] = 0
+            cc[termios.VTIME] = 0
+            termios.tcsetattr(self.fd, termios.TCSANOW,
+                              [iflag, oflag, cflag, lflag, speed, speed, cc])
+        except (OSError, termios.error):
+            raise ConnectError("can't connect COM port")
+
+    # -- Windows ---------------------------------------------------------- #
+    def _open_win(self, device, baud):
+        import ctypes
+        from ctypes import wintypes
+        self._win = True
+        k32 = ctypes.windll.kernel32
+        self._k32 = k32
+        k32.CreateFileW.restype = wintypes.HANDLE
+        h = k32.CreateFileW("\\\\.\\" + device, 0xC0000000, 0, None, 3, 0, None)
+        if h in (None, wintypes.HANDLE(-1).value, -1):
+            raise ConnectError("can't connect COM port")
+        self.h = h
+
+        class DCB(ctypes.Structure):
+            _fields_ = [("DCBlength", wintypes.DWORD), ("BaudRate", wintypes.DWORD),
+                        ("flags", wintypes.DWORD), ("wReserved", wintypes.WORD),
+                        ("XonLim", wintypes.WORD), ("XoffLim", wintypes.WORD),
+                        ("ByteSize", ctypes.c_ubyte), ("Parity", ctypes.c_ubyte),
+                        ("StopBits", ctypes.c_ubyte), ("XonChar", ctypes.c_char),
+                        ("XoffChar", ctypes.c_char), ("ErrorChar", ctypes.c_char),
+                        ("EofChar", ctypes.c_char), ("EvtChar", ctypes.c_char),
+                        ("wReserved1", wintypes.WORD)]
+
+        class TMO(ctypes.Structure):
+            _fields_ = [("ReadIntervalTimeout", wintypes.DWORD),
+                        ("ReadTotalTimeoutMultiplier", wintypes.DWORD),
+                        ("ReadTotalTimeoutConstant", wintypes.DWORD),
+                        ("WriteTotalTimeoutMultiplier", wintypes.DWORD),
+                        ("WriteTotalTimeoutConstant", wintypes.DWORD)]
+        dcb = DCB()
+        dcb.DCBlength = ctypes.sizeof(DCB)
+        ok = k32.GetCommState(h, ctypes.byref(dcb))
+        dcb.BaudRate = baud
+        dcb.ByteSize = 8
+        dcb.Parity = 0
+        dcb.StopBits = 0
+        dcb.flags = 0x1 | 0x10  # fBinary | fDtrControl=ENABLE
+        tm = TMO(0, 0, 100, 0, 1000)  # чтение возвращается не позже, чем через 100 мс
+        if not (ok and k32.SetCommState(h, ctypes.byref(dcb)) and
+                k32.SetCommTimeouts(h, ctypes.byref(tm))):
+            k32.CloseHandle(h)
+            raise ConnectError("can't connect COM port")
+
+    def send(self, data: bytes) -> None:
+        if self._win:
+            import ctypes
+            from ctypes import wintypes
+            n = wintypes.DWORD(0)
+            if not self._k32.WriteFile(self.h, data, len(data), ctypes.byref(n), None):
+                raise OSError("serial write failed")
+        else:
+            view = memoryview(data)
+            while view:
+                try:
+                    n = os.write(self.fd, view)
+                    view = view[n:]
+                except BlockingIOError:
+                    select.select([], [self.fd], [], 1.0)
+
+    def recv(self) -> bytes:
+        while not self._closed:
+            if self._win:
+                import ctypes
+                from ctypes import wintypes
+                buf = ctypes.create_string_buffer(1024)
+                n = wintypes.DWORD(0)
+                if not self._k32.ReadFile(self.h, buf, 1024, ctypes.byref(n), None):
+                    return b""
+                if n.value:
+                    return buf.raw[:n.value]
+            else:
+                try:
+                    r, _, _ = select.select([self.fd], [], [], 0.1)
+                    if r:
+                        d = os.read(self.fd, 1024)
+                        if d:
+                            return d
+                except OSError:
+                    return b""
+        return b""
+
+    def close(self) -> None:
+        self._closed = True
+        try:
+            if self._win:
+                self._k32.CloseHandle(self.h)
+            else:
+                os.close(self.fd)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# Разбор строки порта
+# --------------------------------------------------------------------------- #
+
+class _PortSpec:
+    """Разобранная строка порта.
+
+    ``"TCP [[login@]host] [port] [timeout_ms] [nodelay]"`` или ``"COMn [baud]"``.
+    """
+
+    def __init__(self, text: str):
+        self.text = text
+        toks = (text or "").split()
+        if not toks:
+            raise CommuError("bad commu_port")
+        kind = toks[0]
+        if kind.upper() == "TCP":
+            self.kind = "tcp"
+            self.login = "khidl"
+            self.host = "localhost"
+            self.port = 23
+            self.timeout = 10000
+            self.nodelay = False
+            rest = toks[1:]
+            if rest:
+                host = rest[0]
+                if "@" in host:
+                    self.login, host = host.split("@", 1)
+                    self.login = self.login or "khidl"
+                self.host = host or "localhost"
+            ints = []
+            for t in rest[1:4]:
+                try:
+                    ints.append(int(t))
+                except ValueError:
+                    break
+            if len(ints) > 0:
+                self.port = ints[0]
+            if len(ints) > 1:
+                self.timeout = ints[1]
+            if len(ints) > 2:
+                self.nodelay = bool(ints[2])
+        elif kind.upper().startswith("COM") or kind.startswith("/dev/") or kind.startswith("tty"):
+            self.kind = "com"
+            self.device = kind
+            self.baud = 9600
+            self.timeout = 10000
+            if len(toks) > 1:
+                try:
+                    self.baud = int(toks[1])
+                except ValueError:
+                    raise CommuError("bad commu_port")
+        else:
+            raise CommuError("bad commu_port")
+
+
+# --------------------------------------------------------------------------- #
+# Commu
+# --------------------------------------------------------------------------- #
+
+def _alias(name: str, doc: str = ""):
+    """Свойство-синоним другого атрибута (для имён в стиле .NET)."""
+    return property(lambda self: getattr(self, name),
+                    lambda self, v: setattr(self, name, v), doc=doc)
+
+
+class Commu:
+    """Связь с контроллером робота Kawasaki (аналог ``KRcc.Commu``).
+
+    Конструктору передаётся строка порта::
+
+        "TCP [[login@]host] [port] [timeout_ms] [nodelay]"
+        "COM1 [baud]"                     (экспериментально; только ``command``)
+
+    * ``login`` -- ``"as"`` или ``"khidl"`` (по умолчанию ``"khidl"``);
+    * ``port`` -- по умолчанию 23; ``timeout_ms`` -- ожидание соединения/логина
+      (по умолчанию 10000 мс; в справке написано 20 с, но в DLL зашито 10 с);
+    * ``nodelay`` -- ``1`` включает ``TCP_NODELAY``.
+
+    Примеры строк: ``"TCP 192.168.0.2"``, ``"TCP as@192.168.0.2 9000 3000 1"``,
+    ``"TCP localhost 9105"`` (PC-AS / PC-ROSET).
+
+    Исключения конструктора: :class:`ConnectError` (``"can't connect TCP/IP"``),
+    :class:`LoginError` (``"can't login"``), :class:`NoResponseError`.
+
+    Атрибуты-делегаты (по умолчанию ``None``): :attr:`as_inquiry`,
+    :attr:`cmd_inquiry`, :attr:`progress`.  Один экземпляр безопасно использовать
+    из нескольких потоков: команды выполняются строго по очереди.
+    """
+
+    #: Пауза после приветствия telnet перед отправкой логина (в оригинале 1 с).
+    LOGIN_DELAY = 1.0
+    #: Кодировка текста на проводе. latin-1 без потерь отображает любые байты.
+    encoding = "latin-1"
+    #: Перевод строки при записи файлов в ``save``. ``None`` -- как в оригинале
+    #: (текстовый режим C: ``\r\n`` на Windows, ``\n`` на Linux/macOS); можно
+    #: задать ``"\n"`` или ``"\r\n"``, чтобы получать одинаковые файлы везде.
+    newline: Optional[str] = None
+
+    def __init__(self, port: str):
+        self.asInquiry: Optional[ASInquiry] = None
+        self.progress: Optional[Progress] = None
+        self.cmdInquiry: Optional[CmdInquiry] = None
+        self._timeout_value = 5000
+        self._load_save_msg = ""
+        self._name = port
+        self._ring = _Ring()
+        self._cmd_lock = threading.RLock()
+        self._transport = None
+        self._rx_thread: Optional[threading.Thread] = None
+        self._closed = True
+        self._login_ok = False
+        self._log = None
+        self._log_lock = threading.Lock()
+        self._log_on = False
+        # состояние save/load
+        self._fname = ""
+        self._fp = None
+        self._total = -1
+        self._written = 0
+        self._open(port)
+
+    # -- синонимы имён ---------------------------------------------------- #
+    as_inquiry = _alias("asInquiry", "Делегат :data:`ASInquiry`.")
+    cmd_inquiry = _alias("cmdInquiry", "Делегат :data:`CmdInquiry`.")
+
+    # -- контекстный менеджер -------------------------------------------- #
+    def __enter__(self) -> "Commu":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.dispose()
+
+    def __del__(self):
+        try:
+            self.dispose()
+        except Exception:
+            pass
+
+    # ===================================================================== #
+    # Свойства
+    # ===================================================================== #
+    @property
+    def is_connected(self) -> bool:
+        """``True``, если соединение установлено (``False`` после обрыва)."""
+        return self._transport is not None and not self._closed
+
+    IsConnected = is_connected
+
+    @property
+    def timeout_value(self) -> int:
+        """Тайм-аут ``load``/``save`` в мс (запись). По умолчанию 5000."""
+        return self._timeout_value
+
+    @timeout_value.setter
+    def timeout_value(self, ms: int) -> None:
+        self._timeout_value = int(ms)
+
+    TimeoutValue = timeout_value
+
+    @property
+    def load_save_msg(self) -> str:
+        """Сообщения контроллера, накопленные за последний ``load``/``save``.
+
+        В них имя ``using.rcc`` заменено реальным именем файла. Вопросы, на
+        которые был дан ответ, сюда не попадают.
         """
-        Handles telnet options. 
+        return self._load_save_msg
 
-        We need to respond to some options to make the telnet connection work.
+    LoadSaveMsg = load_save_msg
+
+    # ===================================================================== #
+    # Соединение
+    # ===================================================================== #
+    def name(self) -> str:
+        """Имя порта в том виде, как оно было передано (``"TCP 192.168.0.2"``)."""
+        return self._name
+
+    def connect(self, port: str) -> int:
+        """(Пере)подключиться к контроллеру.
+
+        Возвращает ``0`` -- успех, ``-1`` -- ошибка соединения (таймаут),
+        ``-2`` -- ошибка логина.
         """
-        IS = b'\00'
-        if cmd == tlib.WILL and opt == tlib.ECHO:
-            # We want to echo the characters we type
-            socket.sendall(tlib.IAC + tlib.DO + opt) 
-        elif cmd == tlib.DO and opt == tlib.TTYPE:
-            # We want to send the terminal type
-            socket.sendall(tlib.IAC + tlib.WILL + tlib.TTYPE)
-        elif cmd == tlib.SB:
-            # This is a suboption
-            socket.sendall(tlib.IAC + tlib.SB + tlib.TTYPE + IS + 'VT100'.encode() + IS + tlib.IAC + tlib.SE)
-        elif cmd == tlib.SE: 
-            # This is a suboption end
-            pass 
-        else: logger.error('Unexpected telnet negotiation')
-
-    def __write(self, data: bytearray) -> int:
-        """
-        Writes the data to the connection.
-
-        Args:
-            data (bytearray): The data to write.
-
-        Returns:
-            int: The number of bytes written.
-        """
-        bytes_written = self.__telnet_connection.write(data)
-        self.__log(data)
-        return bytes_written
-
-    def __read_until(self, match: bytearray, timeout: int = None) -> bytearray:
-        """
-        Reads from the connection until a match is found.
-
-        Args:
-            match (bytearray): The match to search for.
-            timeout (int, optional): The timeout in milliseconds. Defaults to None.
-
-        Returns:
-            bytearray: The data read from the connection.
-        """
-        if timeout is None:
-            timeout = self.TimeoutValue
-        response = self.__telnet_connection.read_until(match, timeout)
-        self.__log(response)
-        return response
-
-    def __read_until_many(self, matches: list, timeout: int = None) -> bytearray:
-        """
-        Reads from the connection until one of the matches is found.
-
-        Args:
-            matches (list): A list of matches to search for.
-            timeout (int, optional): The timeout in milliseconds. Defaults to None.
-
-        Returns:
-            bytearray: The data read from the connection.
-        """
-        if timeout is None:
-            timeout = self.TimeoutValue
-        response = self.__telnet_connection.expect(matches, timeout)
-        self.__log(response[2])
-        return response[2]
-
-    def __read_eager(self) -> bytearray:
-        """
-        Reads all the available data from the connection.
-
-        Returns:
-            bytearray: The data read from the connection.
-        """
-        response = self.__telnet_connection.read_eager()
-        self.__log(response)
-        return response
-
-    def __get_savefile(self, prog: str = None, qual: str = None) -> bytes:
-        """
-        Reads the source code of the program from the controller and returns it.
-
-        Args:
-            prog (str, optional): Program name. Defaults to None.
-            qual (str, optional): Qualifier. Defaults to None.
-
-        Returns:
-            bytes: The source code of the program.
-        """
-        _prog = ''
-        if prog is not None:
-            _prog = '=' + prog
-        _qual = ''
-        if qual is not None:
-            _qual = qual
-        
-        if self.__logging_file:
-            self.__logging_file.write(f'save{_qual} file.as{_prog}\n')
-        self.__write(f'save{_qual} file.as{_prog}\r\n'.encode())
-        response = self.__read_until(b'.as', 1)
-        if self.__logging_file:
-            self.__logging_file.write('Saving...(file.as)')
-        # Check if save/load is in progress
-        if b'LOAD in progress' in response:
-            logger.error('SAVE/LOAD in progress')
-            if self.__logging_file:
-                self.__logging_file.write('SAVE/LOAD in progress')
+        self._shutdown()
+        try:
+            self._open(port)
+        except LoginError:
             return -2
-        self.__write(b'\x02B    0\x17')
-        switch = True
-        raw_data = b''
-
-        while True:
-            if switch:
-                data_block = self.__read_until(b'\x05\x02')
-                if data_block == b'':
-                    break
-                raw_data = raw_data + data_block
-                data_block = self.__read_eager()
-                if data_block == b'':
-                    break
-                raw_data = raw_data + data_block
-                if b'E\x17' in data_block:
-                    break
-            else:
-                data_block = self.__read_until(b'\x17')
-                raw_data = raw_data + data_block
-                if b'E\x17' in data_block:
-                    break
-
-            switch = not switch
-        self.__write(b'\x02\x45' + b'    0' + b'\x17')
-        self.__write(b'\r\n')
-        self.__write(b'\x02' + b'E    0' + b'\x17')
-        data_block = self.__read_until(b'>')
-
-        return raw_data
-
-    def __process_data(self, data: bytearray) -> list:
-        """
-        Processes the data from the robot after save command.
-
-        Args:
-            data (bytearray): Raw data from the robot after save command.
-
-        Returns:
-            list: List of strings which are the actual source code of the program.
-        """
-        data = re.sub(rb'\x17{0,1}\x05\x02[DE]{0,1}', b'', data)
-        clean_data = []
-        for line in data.splitlines():
-            if line and not line.startswith(b'\x17') and not line.startswith(b'Bfile.as') and not line.startswith(b'='):
-                clean_data.append(line)
-            else:
-                if line.startswith(b'Bfile.as'):
-                    continue
-                self.__log(line.replace(b'\x17', b'') + b'\n')
-        return clean_data
-
-    def __split_content_to_blocks(self, content: list) -> list:
-        """
-        Splits the content into blocks which are acceptable by the robot.
-
-        Args:
-            content (list): The content to split.
-
-        Returns:
-            list: A list of blocks.
-        """
-        max_chars = 492
-        
-        content_blocks = []
-        block = ''
-
-        for line in content:
-            if len(block) + len(line) + 2 >= max_chars:
-                content_blocks.append(block)
-                block = ''
-            block = block + line 
-        if block != '':
-            content_blocks.append(block)
-        return content_blocks
-
-    def __connect(self) -> int: 
-        """ 
-        Tries to establish connection to the robot and login.
-
-        Returns:
-            int: 0 if connected successfully, 
-            -1 if connection could not be established, 
-            -2 if timeout occurred while trying to login, 
-            -3 if an unexpected error occurred while trying to login.
-        """ 
-        # Trying to establish connection
-        try: 
-            logger.debug(f'Connecting to robot with {self.__ip}:{self.__port}')
-            self.__telnet_connection = tlib.Telnet()
-            self.__telnet_connection.set_option_negotiation_callback(self.__process_options)
-            self.__telnet_connection.open(self.__ip, self.__port, self.TimeoutValue)
-            self.__telnet_connection.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, self.__tcp_nodelay)
-            logger.debug('Connected successfully')
-        except Exception as e:
-            logger.error(f'Failed to connect to robot: {e}')
+        except CommuError:
             return -1
-        # Trying to login
-        try:
-            time.sleep(0.5)
-            logger.debug('Trying to login') 
-            self.__read_until(b'login: ')
-            self.__write(self.__login.encode() + b'\r\n')
-            self.__read_until(b'>')
-        except TimeoutError:
-            logger.error('Timeout while trying to login')
-            return -2
-        except Exception as e:
-            logger.error(f'Unexpected error while trying to login: {e}')
-            return -3
-        self.IsConnected = True
         return 0
 
-    def connect(self, port_str: str = None, login: str = 'khidl', ip: str = None, port: int = 23, timeout: int = 20000, tcp_nodelay:bool = False):
-        """
-        Connects to the robot.
-
-        Args:
-            port_str (str, optional): Port string (e.g. 'COM1'). Defaults to None.
-            login (str, optional): Login string. Defaults to 'khidl'.
-            ip (str, optional): IP address of the robot. Defaults to None.
-            port (int, optional): Port number. Defaults to 23.
-            timeout (int, optional): Timeout in milliseconds. Defaults to 20000.
-            tcp_nodelay (bool, optional): TCP_NODELAY option. Defaults to False.
-
-        Returns:
-            int: 0 if connected successfully, 
-            -1 if failed to connect, 
-            -2 if failed to login.
-        """
-        # Initialize parameters
-        self.__port_str = port_str
-        self.__login = login
-        self.__ip = ip
-        self.__port = port
-        self.TimeoutValue = timeout
-        self.__tcp_nodelay = tcp_nodelay
-
-        return self.__connect()
-
     def disconnect(self) -> bool:
-        """
-        Disconnects from the robot.
-
-        Returns:
-            bool: True if disconnected successfully, False if not.
-        """
-        if not self.IsConnected:
-            logger.info('Robot is already disconnected')
-            return True
+        """Закрыть соединение. ``True`` -- успех."""
         try:
-            self.__telnet_connection.close()
-        except Exception as e:
-            logger.error(f'Failed to close connection: {e}')
+            self._shutdown()
+            return True
+        except Exception:
             return False
-        self.IsConnected = False
-        logger.info('Robot disconnected')
+
+    def dispose(self) -> None:
+        """Освободить ресурсы: закрыть соединение и журнал."""
+        self._shutdown()
+        self.stop_log()
+
+    Dispose = dispose
+
+    # ===================================================================== #
+    # AS-команды
+    # ===================================================================== #
+    def command(self, cmd: Optional[str] = None, tmo: Optional[int] = None) -> List:
+        """Отправить AS-команду и вернуть ``[код, ответ]``.
+
+        * ``command()`` -- ничего не отправляет, забирает уже принятые сообщения
+          (например ``"(E1135) Motor power OFF."``);
+        * ``command(cmd)`` -- то же, что ``command(cmd, 500)``;
+        * ``command(cmd, tmo)`` -- ``tmo`` в мс -- время ожидания каждой строки/
+          приглашения. Отрицательное значение -- ждать до 60 с.
+
+        Код: ``0`` -- успех (получено приглашение ``>``); ``-1`` -- таймаут без
+        ответа; ``-2`` -- таймаут, но часть ответа получена (например контроллер
+        ждёт ответа на вопрос -- его можно отправить следующим ``command``).
+
+        Если задан :attr:`cmd_inquiry`, строки ответа передаются ему, а во втором
+        элементе возвращается пустая строка.
+        """
+        if cmd is not None and tmo is None:
+            tmo = 500
+        if cmd is None:
+            tmo = 0
+        if not self.is_connected and self._ring.empty():
+            return [-1, ""]
+        try:
+            with self._cmd_lock:
+                code, text = self._command(cmd, int(tmo))
+        except (OSError, CommuError):
+            self._closed = True
+            return [-2, ""]
+        return [code, text]
+
+    # ===================================================================== #
+    # SAVE / LOAD
+    # ===================================================================== #
+    def load(self, fname: str, qual: str = "") -> int:
+        """Загрузить файл ``fname`` в контроллер (``LOAD [qual] file``).
+
+        ``qual`` -- модификатор, например ``"/Q"`` (контроллер будет задавать
+        вопросы -- см. :attr:`as_inquiry`).
+
+        Возвращает ``0`` -- норма, ``-1`` -- таймаут, ``-2`` -- ошибка контроллера,
+        ``-3`` -- внутренняя ошибка (файл не открывается), ``>0`` -- число
+        интерактивных вопросов, на которые был дан ответ.
+        """
+        if not self.is_connected:
+            return -1
+        if not fname:
+            return -3
+        try:
+            with open(fname, "rb"):
+                pass
+        except OSError:
+            return -3
+        with self._cmd_lock:
+            try:
+                self._fname = fname
+                self._fp = None
+                self._total = -1
+                self._written = 0
+                cmd = "LOAD " + ((qual + " ") if qual else "") + _DUMMY_NAME
+                if self._send_command(cmd) < 0:
+                    return -2
+                code = self._svld_seq()
+                self._notify_progress(-1, self._total)
+                return code
+            except OSError:
+                self._closed = True
+                return -1
+            finally:
+                self._close_file()
+
+    def save(self, fname: str, prog: str = "", qual: str = "") -> int:
+        """Сохранить данные контроллера в файл (``SAVE[qual] file[=prog]``).
+
+        * ``save("foo.as")`` -- всё содержимое;
+        * ``save("foo", "pg1,pg2")`` -- только перечисленные программы;
+        * ``save("foo", "pg1", "/P")`` -- с модификатором (``/P``, ``/R``, ``/L`` ...).
+
+        Значения возврата -- как у :meth:`load`.
+        """
+        if not self.is_connected:
+            return -1
+        if prog.startswith("/"):          # save(fname, "/P") == save(fname, "", "/P")
+            prog, qual = qual, prog
+        with self._cmd_lock:
+            try:
+                self._fname = fname
+                self._fp = None
+                self._total = -1
+                self._written = 0
+                cmd = "SAVE" + qual + " " + _DUMMY_NAME + (("=" + prog) if prog else "")
+                if self._send_command(cmd) < 0:
+                    return -2
+                code = self._svld_seq()
+                self._notify_progress(-1, -1)
+                return code
+            except OSError:
+                self._closed = True
+                return -1
+            finally:
+                self._close_file()
+
+    # ===================================================================== #
+    # Журнал
+    # ===================================================================== #
+    def start_log(self, log_fname: str) -> bool:
+        """Начать запись всего, что присылает контроллер, в файл. ``False`` -- ошибка."""
+        self.stop_log()
+        try:
+            f = open(log_fname, "w", encoding=self.encoding, newline="\n", errors="replace")
+            f.write("======== RCC LOG =======\n%s\n========================\n" % time.asctime())
+            f.flush()
+        except OSError:
+            return False
+        with self._log_lock:
+            self._log = f
         return True
 
-    def name(self) -> str:
-        """
-        Name of the connection.
+    startLog = start_log
 
-        Returns:
-            str: Name of the connection in format 'TCP <login>@<ip>, <port>, <timeout>{,TCP_NODELAY}'.
-        """
-        return f'TCP {self.__login}@{self.__ip}, {self.__port}, {self.TimeoutValue}{"," if not self.__tcp_nodelay else "TCP_NODELAY"}'
-
-    def startLog(self, log_fname: str) -> bool:
-        """
-        Starts logging to file.
-
-        Args:
-            log_fname (str): Name of the log file.
-
-        Returns:
-            bool: True if logging started successfully, False if not.
-        """
-        try:
-            self.__logging_file = open(log_fname, 'a')
-            self.__logging = True
+    def stop_log(self) -> bool:
+        """Остановить запись журнала."""
+        with self._log_lock:
+            f, self._log = self._log, None
+        if f is None:
             return True
-        except Exception as e:
-            logger.error(f'Failed to open logging file: {e}')
+        try:
+            f.close()
+            return True
+        except OSError:
             return False
 
-    def stopLog(self) -> bool:
-        """
-        Stop logging to file.
+    stopLog = stop_log
 
-        Returns:
-            bool: True if logging stopped successfully, False if not.
-        """
+    # ===================================================================== #
+    # Внутренности: соединение
+    # ===================================================================== #
+    def _open(self, port: str) -> None:
+        spec = _PortSpec(port)
+        self._name = port
+        self._ring = _Ring()
+        self._login_ok = False
+        self._closed = False
+        if spec.kind == "tcp":
+            tr = _TcpTransport(spec.host, spec.port, spec.timeout, spec.nodelay)
+        else:
+            tr = _SerialTransport(spec.device, spec.baud)
+        self._transport = tr
+        self._rx_thread = threading.Thread(target=self._rx_main, name="krcc-rx", daemon=True)
+        self._rx_thread.start()
         try:
-            self.__logging_file.close()
-            self.__logging_file = None
-            self.__logging = False
-            return True
-        except Exception as e:
-            logger.error(f'Failed to close logging file: {e}')
-            return False
+            if spec.kind == "tcp":
+                tr.send(_TELNET_GREETING)
+                time.sleep(self.LOGIN_DELAY)
+                tr.send(spec.login.encode("latin-1") + b"\r\n")
+            else:
+                tr.send(b"\n")
+            waited = 0
+            while not self._login_ok:
+                if self._closed or waited >= spec.timeout:
+                    raise LoginError("can't login")
+                time.sleep(0.05)
+                waited += 50
+            code, _ = self._command('type ""', 5000)
+            if code < 0:
+                raise NoResponseError("no response %s port" % ("TCP" if spec.kind == "tcp" else "COM"))
+        except OSError:
+            self._shutdown()
+            raise ConnectError("can't connect TCP/IP")
+        except CommuError:
+            self._shutdown()
+            raise
 
-    def command(self, cmd: str = None, timeout: int = None) -> list:
-        """
-        Sends a command to the robot controller and returns the response.
+    def _shutdown(self) -> None:
+        self._closed = True
+        tr, self._transport = self._transport, None
+        if tr is not None:
+            tr.close()
+        t = self._rx_thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=2.0)
+        self._rx_thread = None
+        self._close_file()
 
-        Args:
-            cmd (str, optional): Command string. Defaults to None.
-            timeout (int, optional): Timeout in milliseconds. Defaults to None.
+    # -- поток приёма ----------------------------------------------------- #
+    def _rx_main(self) -> None:
+        tr = self._transport
+        ring = self._ring
+        buf = b""
+        pos = 0
 
-        Returns:
-            list: A list containing the return code and the response string. 
-            Return code is 0 if the command was sent successfully, 
-            -1 if timeout occurred, 
-            -2 if not connected, 
-            -3 if the command was invalid, 
-            -4 if the request was denied, 
-            -5 if an error occurred.
-        """
-        if not self.IsConnected:
-            return (-2, 'Not connected')
-        if cmd is None:
-            cmd = ''
-        response_ret = b''
-        try:
-            self.__write(cmd.encode() + b'\r\n')
-            response = self.__read_until_many(self.__cmd_terminators, 5)
-            response_ret = response_ret + response
+        def next_byte() -> int:
+            nonlocal buf, pos
+            while pos >= len(buf):
+                if self._closed:
+                    return -1
+                buf = tr.recv()
+                pos = 0
+                if not buf:
+                    return -1
+                _dbg("rx", buf)
+            b = buf[pos]
+            pos += 1
+            return b
+
+        # Фаза 1: ждём приглашение '>' в начале строки.
+        cnt = 0
+        while True:
+            c = next_byte()
+            if c < 0:
+                self._closed = True
+                return
+            self._log_byte(c)
+            if c in (10, _DLE):
+                cnt = 0
+            elif c == 0x3E and cnt == 0:
+                break
+            else:
+                cnt += 1
+        self._login_ok = True
+        self._log_on = True
+
+        # Фаза 2: разбор потока на строки.
+        term = 10
+        n = 0           # символов в текущей (ещё не законченной) строке
+        unput = -1
+        while True:
+            if unput >= 0:
+                ring.push(unput & 0xFF)
+                unput = -1
+                n = 1
+            c = next_byte()
+            if c < 0:
+                self._closed = True
+                return
+            if c == _STX:
+                term = _ETB
+                self._log_on = False
+            elif c == _ENQ:
+                self._log_on = False
+                if n > 1:                       # закончить недописанную строку
+                    unput = _ENQ
+                    ring.push(_FLUSH)
+                    ring.signal()
+                    n = 0
+                    continue
+            if self._log_on and c != 13:
+                self._log_byte(c)
+            if c == term:
+                ring.push(0xFF00 | c)
+                ring.signal()
+                self._log_on = True
+                term = 10
+                n = 0
+            elif c == _DLE:
+                ring.push(0xFF00 | c)
+                ring.signal()
+                n = 0
+            elif c == 0x3E and n == 0:
+                ring.push(0xFF00 | c)
+                ring.signal()
+            else:
+                ring.push(c)
+                n += 1
+
+    def _log_byte(self, c: int) -> None:
+        f = self._log
+        if f is not None and c != 13:
+            with self._log_lock:
+                if self._log is not None:
+                    try:
+                        self._log.write(chr(c))
+                        if c == 10 or c == 0x3E:
+                            self._log.flush()
+                    except (OSError, ValueError):
+                        pass
+
+    # -- отправка --------------------------------------------------------- #
+    def _raw_send(self, data: bytes) -> None:
+        tr = self._transport
+        if tr is None:
+            raise OSError("not connected")
+        _dbg("tx", data)
+        tr.send(data)
+
+    def _enc(self, s: str) -> bytes:
+        return s.encode(self.encoding, "replace")
+
+    def _dec(self, b: bytes) -> str:
+        return b.decode(self.encoding, "replace")
+
+    # ===================================================================== #
+    # Внутренности: command()
+    # ===================================================================== #
+    @staticmethod
+    def _strip_ctrl(text: str) -> Tuple[str, List[int]]:
+        """Заменить по одному управляющему символу каждого вида пробелом."""
+        found = []
+        for ctrl in _CTRL:
+            ch = chr(ctrl)
+            i = text.find(ch)
+            if i >= 0:
+                text = text[:i] + " " + text[i + 1:]
+                found.append(ctrl)
+        return text, found
+
+    def _send_command(self, cmd: str) -> int:
+        """Отправить команду, не дожидаясь ответа (для SAVE/LOAD)."""
+        code, _ = self._command(cmd, 0)
+        return code
+
+    def _command(self, cmd: Optional[str], tmo: int) -> Tuple[int, str]:
+        ring = self._ring
+        cb = self.cmdInquiry
+        resp: List[str] = []
+
+        if cmd is None:                              # забрать накопленное
             while True:
-                request = self.cmdInquiry(response)
-                if request is None:
+                line, _ = ring.get(0)
+                if not line:
                     break
-                self.__write(request)
-                response = self.__read_until_many(self.__cmd_terminators, 5)
-                response_ret = response_ret + response
-            return (0, response_ret.decode())    
-        
-        except TimeoutError:
-            logger.warning('Timeout while reading')
-            return (-1, 'Timeout while reading')
-        except Exception as e:
-            logger.error(f'Unexpected error: {e}')
-            return (-2, 'Unexpected error')
+                text = self._dec(line)
+                if text != ">":
+                    self._deliver(text, cb, resp)
+            return 0, "".join(resp)
 
-    def default_cmd_inquiry(self, as_msg: bytearray) -> bytearray:
-        """
-        Default inquiry function for commands.
+        pos = 0
+        while True:
+            nl = cmd.find("\n", pos)
+            seg = cmd[pos:] if nl < 0 else cmd[pos:nl]
+            pos = -1 if nl < 0 else nl + 1
 
-        Checks if the response contains any inquiry strings and returns the appropriate response.
-        """
-        if b'\x0a>' in as_msg:
-            return None
-        if b'Press SPACE key to continue.' in as_msg:
-            return b' '
-        if b'Yes:1, No:0' in as_msg:
-            return b'1'
-        return b''
+            while True:                              # выбросить устаревшее
+                line, _ = ring.get(0)
+                if not line:
+                    break
+            self._raw_send(self._enc(seg))
+            self._raw_send(b"\n")
 
-    def default_as_inquiry(self, as_msg: bytearray) -> bytearray:
-        """
-        Default inquiry function for save/load commands.
+            if tmo != 0:
+                echo_pending = True
+                while True:
+                    line, timed_out = ring.get(tmo)
+                    if line is None:
+                        if timed_out or self._closed:
+                            return (-1 if not resp else -2), "".join(resp)
+                        continue
+                    if not line:
+                        continue
+                    text = self._dec(line)
+                    if echo_pending:
+                        for ctrl in _CTRL:
+                            if chr(ctrl) in text and ctrl == _SYN:
+                                self._raw_send(b"\r\n")
+                        first = text
+                        for sep in ("\r", "\n"):
+                            k = first.find(sep)
+                            if k >= 0:
+                                first = first[:k]
+                        if first == seg:
+                            echo_pending = False
+                        else:
+                            _dbg("garbage:", text)
+                        continue
+                    if text == ">":
+                        break
+                    done = self._deliver(text, cb, resp)
+                    if done:
+                        break
+            if pos < 0:
+                break
+        return 0, "".join(resp)
 
-        Checks if the response contains any inquiry strings and returns the appropriate response.
-        """
-        if b'errors' in as_msg:
-            return b'break'
-        if b'1:Yes, 0:No / 2:Load all, 3:Exit' in as_msg:
-            return b'2\r\n'
-        if b'E\x17' in as_msg:
-            return None
-        if b'Delete program and abort' in as_msg:
-            return b'0\r\n'
-        if b'Are you sure' in as_msg:
-            return b'1\r\n'
-        if b'Force load' in as_msg:
-            return b'9\r\n'
-        if b'Press ENTER.' in as_msg:
-            return b'\r\n'
+    def _deliver(self, text: str, cb: Optional[CmdInquiry], resp: List[str]) -> bool:
+        """Обработать строку ответа. ``True`` -- конец ответа на команду."""
+        clean, found = self._strip_ctrl(text)
+        if _SYN in found:
+            self._raw_send(b"\r\n")
+        if cb is not None:
+            reply = cb(clean)
+            if reply:
+                self._raw_send(self._enc(reply))
+            return False
+        if found:                    # строка с управляющим кодом -- контроллер ждёт ввода
+            return True
+        resp.append(text)
+        return False
+
+    # ===================================================================== #
+    # Внутренности: SAVE/LOAD
+    # ===================================================================== #
+    def _notify_progress(self, done: int, total: int) -> None:
+        cb = self.progress
+        if cb is not None:
+            cb(done, total)
+
+    def _close_file(self) -> None:
+        fp, self._fp = self._fp, None
+        if fp is not None:
+            try:
+                fp.close()
+            except OSError:
+                pass
+
+    def _interactive(self, msg: str) -> Optional[str]:
+        """Ответ на вопрос контроллера: сначала делегат, затем таблица."""
+        cb = self.asInquiry
+        if cb is not None:
+            r = cb(msg)
+            if r is not None:
+                return r
+        for pat, resp in DEFAULT_RESPONSES:
+            if pat in msg:
+                return resp
         return None
 
-    def default_progress(self, val: int, total: int) -> None:
-        """
-        Default progress function.
+    def _svld_seq(self) -> int:
+        """Главный цикл SAVE/LOAD: обслуживает кадры файла и вопросы контроллера."""
+        ring = self._ring
+        result = 0
+        count = 0
+        self._load_save_msg = ""
+        tmo = self._timeout_value
+        converted = "(" + _DUMMY_NAME + ")"
+        while True:
+            line, timed_out = ring.get(250)
+            if line is None:
+                if not timed_out:
+                    continue
+                tmo -= 250
+                if tmo <= 0 or self._closed:
+                    return -1
+                continue
+            tmo = self._timeout_value
+            if not line:
+                continue
+            _dbg("line", line)
+            if line[:1] == b">" or line[:2] == b"\x07>" or line[:3] == b"\x10\x07>":
+                return result if result < 0 else count
+            if len(line) >= 3 and line[0] == _ENQ and line[1] == _STX and 0x41 <= line[2] <= 0x46:
+                code, reply = self._frame(line)
+                if code < 0 and result >= 0:
+                    result = code
+                if reply:
+                    self._raw_send(reply)
+                continue
+            text = self._dec(line).replace(converted, "(" + self._fname + ")")
+            msg, _ = self._strip_ctrl(text.rstrip("\r\n"))
+            answer = self._interactive(msg)
+            if answer is not None:
+                count += 1
+                self._raw_send(self._enc(answer))
+            else:
+                self._load_save_msg += text
 
-        Simply logs the progress.
+    # -- обработчики кадров ENQ STX <cmd> ... ETB ------------------------- #
+    @staticmethod
+    def _reply(cmd: int, code: int, data: bytes = b"") -> bytes:
+        return bytes([_STX, cmd]) + ("%5d" % code).encode("ascii") + data + bytes([_ETB])
 
-        Args:
-            val (int): Current progress value.
-            total (int): Total progress value.
-        """
-        logger.info(f'Progress: {val}/{total}')
-        return
+    def _frame(self, frame: bytes) -> Tuple[int, bytes]:
+        cmd = frame[2]
+        if cmd == 0x41:                                   # 'A' -- открыть для чтения
+            code = 0
+            try:
+                self._close_file()
+                self._fp = open(self._fname, "rb")
+                self._fp.seek(0, 2)
+                self._total = self._fp.tell()
+                self._fp.seek(0)
+            except OSError:
+                code = _E_OPEN
+            return code, self._reply(cmd, code)
+        if cmd == 0x42:                                   # 'B' -- открыть для записи
+            code = 0
+            try:
+                self._close_file()
+                self._fp = open(self._fname, "w", encoding=self.encoding, errors="replace",
+                                newline=self.newline)
+                self._written = 0
+            except OSError:
+                code = _E_OPEN
+            return code, self._reply(cmd, code)
+        if cmd == 0x43:                                   # 'C' -- прочитать порцию
+            if self._fp is None:
+                return _E_OPEN, self._reply(cmd, _E_OPEN)
+            data = self._fp.read(_CHUNK)
+            data = data.split(b"\0", 1)[0]                # C-строка
+            if not data:
+                data = bytes([_SUB])
+            self._notify_progress(self._fp.tell(), self._total)
+            return 0, self._reply(cmd, 0, data)
+        if cmd == 0x44:                                   # 'D' -- записать строку
+            if self._fp is None or _ETB not in frame:
+                return _E_OPEN, self._reply(cmd, _E_OPEN)
+            data = frame[3:]
+            if data[:1] == bytes([_SUB]):
+                return 0, b""
+            end = len(data) - 1                           # без ETB
+            for sep in (b"\r", b"\n"):
+                k = frame.find(sep)
+                if k >= 0:
+                    end = min(end, k - 3)
+            line = self._dec(data[:end])
+            self._fp.write(line + "\n")
+            self._written += len(line) + 1
+            self._notify_progress(self._written, -1)
+            return 0, b""                                 # при успехе ответа нет
+        if cmd == 0x45:                                   # 'E' -- закрыть файл
+            self._close_file()
+            return 0, self._reply(cmd, 0)
+        return 0, self._reply(cmd, 0)                     # 'F' -- удалить (не делаем)
 
-    def load(self, fname: str, qual: str = None) -> int:
-        """
-        Loads a file into the controller.
 
-        Args:
-            fname (str): Name of the file to load.
-            qual (str, optional): Qualifier string. Defaults to None.
-
-        Returns:
-            int: Return code. 0 if the file was loaded successfully, 
-            -1 if timeout occurred, 
-            -2 if not connected, 
-            -3 if the file does not exist, 
-            -4 if an error occurred.
-        """
-        # Check connection
-        if not self.IsConnected:
-            logger.error('Not connected')
-            return -3
-        # Disable logging while loading
-        enable_later = False
-        if self.__logging:
-            enable_later = True
-            self.__logging = False
-        # Get qualifier
-        _qual = b''
-        if qual is not None:
-            _qual = qual.encode()
-        # Load file
-        try:
-            max_chars = 470
-            with open(fname, 'r') as f:
-                content = f.readlines()
-            file_size = os.path.getsize(fname)
-            logger.debug(f'File size: {file_size}')
-            content_blocks = self.__split_content_to_blocks(content)
-        except FileNotFoundError:
-            logger.error(f'File not found: {fname}')
-            return -3
-        except Exception as e:
-            logger.error(f'Unexpected error: {e}')
-            return -4
-        finally:
-            self.__logging = enable_later
-        # Load data to controller
-        try:
-            self.__write(b'load'+ _qual + b' file'  + b'\r\n')
-            # Add to logging file
-            if self.__logging_file is not None:
-                self.__logging_file.write(f'load{_qual.decode()} file\r\n')
-            response = self.__read_until_many(self.__as_terminators, 2)
-            # Check if load is in progress
-            if b'LOAD in progress' in response:
-                logger.error('SAVE/LOAD in progress')
-                if self.__logging_file:
-                    self.__logging_file.write('SAVE/LOAD in progress')
-                return -2
-            self.__write(b'\x02A    0\x17')
-            response = self.__read_until(b'\x17')
-            logger.debug(response)
-            
-            empty_counter = 0
-            loaded_size = 0
-            for block in content_blocks:
-                loaded_size = loaded_size + len(block.encode())
-                self.progress(loaded_size, file_size)
-                self.__write(b'\x02C    0' + block.encode() + b'\r\n\x17')
-                response = self.__read_until_many(self.__as_terminators, 1)
-                logger.debug(response)
-                request = self.asInquiry(response)
-                if request is not None:
-                    self.__write(request)
-                if response == b'':
-                    empty_counter += 1
-                    if empty_counter > 2:
-                        break
-            empty_counter = 0
-            self.progress(file_size, file_size)
-            while True:
-                response = self.__read_until_many(self.__as_terminators, 1)
-                logger.debug(response)
-                request = self.asInquiry(response)
-                if request is not None:
-                    self.__write(request)
-                if response == b'':
-                    empty_counter += 1
-                    if empty_counter > 2:
-                        break
-            self.__write(b'\x02' + b'C    0' + b'\x1a\x17')
-            self.__write(b'\r\n')
-            response = self.__read_until(b'E\x17')
-            self.__write(b'\x02' + b'E    0' + b'\x17')
-            response = self.__read_until(b'>')
-            return 0
-        except TimeoutError:
-            logger.warning('Timeout while reading')
-            return -1
-        except Exception as e:
-            logger.error(f'Unexpected error: {e}')
-            return -4
-        finally:
-            self.__logging = enable_later
-
-    def save(self, fname: str, prog: str = None, qual: str = None) -> int:
-        """
-        Saves the source code of the program to file.
-
-        Args:
-            fname (str): Name of the file to save the data to.
-            prog (str, optional): Program name. Defaults to None.
-            qual (str, optional): Qualifier. Defaults to None.
-
-        Returns:
-            int: 0 if saved successfully, 
-            -1 if timeout occurred, 
-            -2 if not connected, 
-            -3 if file already exists, 
-            -4 if an error occurred.
-        """
-        enable_later = False
-        if self.__logging:
-            enable_later = True
-            self.__logging = False
-        try:
-            with open(fname, 'w') as f:
-                raw_data = self.__get_savefile(prog, qual)
-                self.__logging = enable_later
-                data_list = self.__process_data(raw_data)
-                f.writelines([line.decode() + '\n' for line in data_list])
-        except TimeoutError:
-            logger.warning('Timeout while reading')
-            return -1
-        except FileExistsError:
-            logger.error(f'File already exists: {fname}')
-            return -3
-        except Exception as e:
-            logger.error(f'Unexpected error: {e}')
-            return -4
-        finally:
-            self.__logging = enable_later
+#: Синоним имени класса (``Ccommu`` из постановки задачи).
+Ccommu = Commu
